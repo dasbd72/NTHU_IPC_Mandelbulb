@@ -1,0 +1,18 @@
+{
+  "configurations": [
+    {
+      "name": "hw2",
+      "intelliSenseMode": "gcc-x64",
+      "includePath": [
+        "${workspaceRoot}",
+        "/usr/include",
+        "/usr/include/c++",
+        "/usr/include/tbb",
+        "/home/ipc22/share/hw2/lodepng"
+      ],
+      "compilerPath": "/opt/intel/compilers_and_libraries_2020.2.254/linux/mpi/intel64/bin/mpicxx",
+      "cppStandard": "c++17"
+    }
+  ],
+  "version": 4
+}

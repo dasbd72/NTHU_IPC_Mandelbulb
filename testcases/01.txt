@@ -1,0 +1,9 @@
+N=2
+n=3
+c=4
+pos=-0.522 2.874 1.340
+tarpos=0 0 0
+width=64
+height=64
+timelimit=5
+valid=/home/ipc22/share/hw2/testcases/01.png
