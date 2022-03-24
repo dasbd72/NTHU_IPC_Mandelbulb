@@ -1,9 +1,11 @@
+#include <lodepng.h>
+#include <mpi.h>
+#include <omp.h>
+
 #include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-
-#include <lodepng.h>
 
 #define GLM_FORCE_SWIZZLE  // vec3.xyz(), vec3.xyx() ...ect, these are called "Swizzle".
 // https://glm.g-truc.net/0.9.1/api/a00002.html
@@ -26,18 +28,18 @@ unsigned int width;        // image width
 unsigned int height;       // image height
 vec2 iResolution;          // just for convenience of calculation
 
-int AA = 2;  // anti-aliasing
+const int AA = 2;  // anti-aliasing
 
-double power = 8.0;           // the power of the mandelbulb equation
-double md_iter = 24;          // the iteration count of the mandelbulb
-double ray_step = 10000;      // maximum step of ray marching
-double shadow_step = 1500;    // maximum step of shadow casting
-double step_limiter = 0.2;    // the limit of each step length
-double ray_multiplier = 0.1;  // prevent over-shooting, lower value for higher quality
-double bailout = 2.0;         // escape radius
-double eps = 0.0005;          // precision
-double FOV = 1.5;             // fov ~66deg
-double far_plane = 100.;      // scene depth
+const double power = 8.0;           // the power of the mandelbulb equation
+const double md_iter = 24;          // the iteration count of the mandelbulb
+const double ray_step = 10000;      // maximum step of ray marching
+const double shadow_step = 1500;    // maximum step of shadow casting
+const double step_limiter = 0.2;    // the limit of each step length
+const double ray_multiplier = 0.1;  // prevent over-shooting, lower value for higher quality
+const double bailout = 2.0;         // escape radius
+const double eps = 0.0005;          // precision
+const double FOV = 1.5;             // fov ~66deg
+const double far_plane = 100.;      // scene depth
 
 vec3 camera_pos;  // camera position in 3D space (x, y, z)
 vec3 target_pos;  // target position in 3D space (x, y, z)
@@ -49,7 +51,8 @@ unsigned char** image;     // 2D image
 void write_png(const char* filename) {
     unsigned error = lodepng_encode32_file(filename, raw_image, width, height);
 
-    if (error) printf("png error %u: %s\n", error, lodepng_error_text(error));
+    if (error)
+        printf("png error %u: %s\n", error, lodepng_error_text(error));
 }
 
 // mandelbulb distance function (DE)
@@ -73,8 +76,9 @@ double md(vec3 p, double& trap) {
         // orbit trap for coloring
         trap = glm::min(trap, r);
 
-        r = glm::length(v);      // update r
-        if (r > bailout) break;  // if escaped
+        r = glm::length(v);  // update r
+        if (r > bailout)
+            break;  // if escaped
     }
     return 0.5 * log(r) * r / dr;  // mandelbulb's DE function
 }
@@ -113,7 +117,8 @@ double softshadow(vec3 ro, vec3 rd, double k) {
         double h = map(ro + rd * t);
         res = glm::min(
             res, k * h / t);  // closer to the objects, k*h/t terms will produce darker shadow
-        if (res < 0.02) return 0.02;
+        if (res < 0.02)
+            return 0.02;
         t += glm::clamp(h, .001, step_limiter);  // move ray
     }
     return glm::clamp(res, .02, 1.);
@@ -123,9 +128,9 @@ double softshadow(vec3 ro, vec3 rd, double k) {
 vec3 calcNor(vec3 p) {
     vec2 e = vec2(eps, 0.);
     return normalize(vec3(map(p + e.xyy()) - map(p - e.xyy()),  // dx
-        map(p + e.yxy()) - map(p - e.yxy()),                    // dy
-        map(p + e.yyx()) - map(p - e.yyx())                     // dz
-        ));
+                          map(p + e.yxy()) - map(p - e.yxy()),  // dy
+                          map(p + e.yyx()) - map(p - e.yyx())   // dz
+                          ));
 }
 
 // first march: find object's surface
@@ -135,8 +140,9 @@ double trace(vec3 ro, vec3 rd, double& trap, int& ID) {
 
     for (int i = 0; i < ray_step; ++i) {
         len = map(ro + rd * t, trap,
-            ID);  // get minimum distance from current ray position to the object's surface
-        if (glm::abs(len) < eps || t > far_plane) break;
+                  ID);  // get minimum distance from current ray position to the object's surface
+        if (glm::abs(len) < eps || t > far_plane)
+            break;
         t += len * ray_multiplier;
     }
     return t < far_plane
@@ -196,8 +202,8 @@ int main(int argc, char** argv) {
                     vec3 ta = target_pos;               // target position
                     vec3 cf = glm::normalize(ta - ro);  // forward vector
                     vec3 cs =
-                        glm::normalize(glm::cross(cf, vec3(0., 1., 0.)));  // right (side) vector
-                    vec3 cu = glm::normalize(glm::cross(cs, cf));          // up vector
+                        glm::normalize(glm::cross(cf, vec3(0., 1., 0.)));        // right (side) vector
+                    vec3 cu = glm::normalize(glm::cross(cs, cf));                // up vector
                     vec3 rd = glm::normalize(uv.x * cs + uv.y * cu + FOV * cf);  // ray direction
                     //---
 
@@ -226,9 +232,9 @@ int main(int argc, char** argv) {
 
                         // use orbit trap to get the color
                         col = pal(trap - .4, vec3(.5), vec3(.5), vec3(1.),
-                            vec3(.0, .1, .2));  // diffuse color
-                        vec3 ambc = vec3(0.3);  // ambient color
-                        double gloss = 32.;     // specular gloss
+                                  vec3(.0, .1, .2));  // diffuse color
+                        vec3 ambc = vec3(0.3);        // ambient color
+                        double gloss = 32.;           // specular gloss
 
                         // simple blinn phong lighting model
                         double amb =
@@ -280,3 +286,13 @@ int main(int argc, char** argv) {
 
     return 0;
 }
+/*
+    time timeout 5 srun -n3 -c4 ./hw2 2 -0.522 2.874 1.340 0 0 0 64 64 output/01.png
+    time timeout 15 srun -n3 -c4 ./hw2 2 4.152 2.398 -2.601 0 0 0 128 128 output/02.png
+    time timeout 150 srun -n2 -c12 ./hw2 2 1.885 -1.570 3.213 0 0 0 512 512 output/03.png
+    time timeout 250 srun -n6 -c6 ./hw2 3 -0.027 -0.097 3.044 0 0 0 512 512 output/04.png
+    time timeout 150 srun -n4 -c6 ./hw2 2 3.726 0.511 -0.096 0 0 0 512 512 output/05.png
+    time timeout 180 srun -n4 -c12 ./hw2 4 0.7725 -0.385 1.3065 0.782 -0.178 0.312 1024 1024 output/06.png
+    time timeout 180 srun -n4 -c12 ./hw2 4 1.1187 -1.234 -0.285 -0.282 -0.312 -0.378 1024 1024 output/07.png
+    time timeout 210 srun -n4 -c12 ./hw2 4 1.1645 2.0475 1.7305 -0.8492 -1.8767 -1.00928 1536 1536 output/08.png
+ */

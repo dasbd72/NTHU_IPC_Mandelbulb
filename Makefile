@@ -1,4 +1,4 @@
-CXX = mpicxx
+CXX = g++
 CC  = mpicc
 CPPFLAGS = -I/home/ipc22/share/hw2/lodepng
 LDFLAGS = -pthread -fopenmp -lm 
