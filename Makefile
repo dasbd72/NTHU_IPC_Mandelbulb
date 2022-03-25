@@ -1,8 +1,9 @@
-CXX = g++
+CXX = mpicxx
 CC  = mpicc
 CPPFLAGS = -I/home/ipc22/share/hw2/lodepng
 LDFLAGS = -pthread -fopenmp -lm 
 CXXFLAGS = -std=c++17 -O3
+# CXXFLAGS = -std=c++17 -O3 -fsanitize=address
 TARGET = hw2
 HW2 = hw2.cc
 LODEPNG = /home/ipc22/share/hw2/lodepng/lodepng.cpp

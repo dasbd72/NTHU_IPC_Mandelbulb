@@ -23,6 +23,8 @@ typedef glm::dvec3 vec3;  // 3D vector (x, y, z) or (r, g, b)
 typedef glm::dvec4 vec4;  // 4D vector (x, y, z, w)
 typedef glm::dmat3 mat3;  // 3x3 matrix
 
+int world_rank;            // Mpi world_rank
+int world_size;            // Mpi world_size
 unsigned int num_threads;  // number of thread
 unsigned int width;        // image width
 unsigned int height;       // image height
@@ -46,6 +48,8 @@ vec3 target_pos;  // target position in 3D space (x, y, z)
 
 unsigned char* raw_image;  // 1D image
 unsigned char** image;     // 2D image
+vec3* raw_color;
+vec3** color;
 
 // save raw_image to PNG file
 void write_png(const char* filename) {
@@ -85,7 +89,7 @@ double md(vec3 p, double& trap) {
 
 // scene mapping
 double map(vec3 p, double& trap, int& ID) {
-    vec2 rt = vec2(cos(pi / 2.), sin(pi / 2.));
+    const vec2 rt = vec2(cos(pi / 2.), sin(pi / 2.));
     vec3 rp = mat3(1., 0., 0., 0., rt.x, -rt.y, 0., rt.y, rt.x) *
               p;  // rotation matrix, rotate 90 deg (pi/2) along the X-axis
     ID = 1;
@@ -151,6 +155,15 @@ double trace(vec3 ro, vec3 rd, double& trap, int& ID) {
 }
 
 int main(int argc, char** argv) {
+    // test
+    /*
+    vec3 col(0.);
+    printf("%lf %lf %lf\n", col.x, col.y, col.x);
+    col = glm::clamp(glm::pow(col, vec3(.4545)), 0., 1.);
+    printf("%lf %lf %lf\n", col.x, col.y, col.x);
+    exit(0);
+    */
+
     // ./source [num_threads] [x1] [y1] [z1] [x2] [y2] [z2] [width] [height] [filename]
     // num_threads: number of threads per process
     // x1 y1 z1: camera position in 3D space
@@ -160,6 +173,9 @@ int main(int argc, char** argv) {
     assert(argc == 11);
 
     //---init arguments
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
     num_threads = atoi(argv[1]);
     camera_pos = vec3(atof(argv[2]), atof(argv[3]), atof(argv[4]));
     target_pos = vec3(atof(argv[5]), atof(argv[6]), atof(argv[7]));
@@ -168,6 +184,7 @@ int main(int argc, char** argv) {
 
     double total_pixel = width * height;
     double current_pixel = 0;
+    unsigned int total_tasks = width * height * AA * AA;
 
     iResolution = vec2(width, height);
     //---
@@ -181,98 +198,120 @@ int main(int argc, char** argv) {
     }
     //---
 
+    //---create color
+    raw_color = new vec3[width * height];
+    color = new vec3*[height];
+
+    for (int i = 0; i < height; ++i) {
+        color[i] = raw_color + i * width;
+    }
+    //---
+
     //---start rendering
+
+// #pragma omp parallel for schedule(dynamic) num_threads(num_threads) collapse(4)
+//     for (int i = 0; i < height; ++i) {
+//         for (int j = 0; j < width; ++j) {
+//             for (int m = 0; m < AA; ++m) {
+//                 for (int n = 0; n < AA; ++n) {
+#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
+    for (int iter = 0; iter < total_tasks; ++iter) {
+        int i = (iter / (AA * AA)) / width;
+        int j = (iter / (AA * AA)) % width;
+        int m = (iter % (AA * AA)) / AA;
+        int n = (iter % (AA * AA)) % AA;
+        vec2 p = vec2(j, i) + vec2(m, n) / (double)AA;
+
+        //---convert screen space coordinate to (-ap~ap, -1~1)
+        // ap = aspect ratio = width/height
+        vec2 uv = (-iResolution.xy() + 2. * p) / iResolution.y;
+        uv.y *= -1;  // flip upside down
+        //---
+
+        //---create camera
+        vec3 ro = camera_pos;               // ray (camera) origin
+        vec3 ta = target_pos;               // target position
+        vec3 cf = glm::normalize(ta - ro);  // forward vector
+        vec3 cs =
+            glm::normalize(glm::cross(cf, vec3(0., 1., 0.)));        // right (side) vector
+        vec3 cu = glm::normalize(glm::cross(cs, cf));                // up vector
+        vec3 rd = glm::normalize(uv.x * cs + uv.y * cu + FOV * cf);  // ray direction
+        //---
+
+        //---marching
+        double trap;  // orbit trap
+        int objID;    // the object id intersected with
+        double d = trace(ro, rd, trap, objID);
+        //---
+
+        //---lighting
+        vec3 col(0.);                          // color
+        vec3 sd = glm::normalize(camera_pos);  // sun direction (directional light)
+        vec3 sc = vec3(1., .9, .717);          // light color
+        //---
+
+        //---coloring
+        if (d < 0.) {        // miss (hit sky)
+            col = vec3(0.);  // sky color (black)
+        } else {
+            vec3 pos = ro + rd * d;              // hit position
+            vec3 nr = calcNor(pos);              // get surface normal
+            vec3 hal = glm::normalize(sd - rd);  // blinn-phong lighting model (vector
+                                                 // h)
+            // for more info:
+            // https://en.wikipedia.org/wiki/Blinn%E2%80%93Phong_shading_model
+
+            // use orbit trap to get the color
+            col = pal(trap - .4, vec3(.5), vec3(.5), vec3(1.),
+                      vec3(.0, .1, .2));  // diffuse color
+            vec3 ambc = vec3(0.3);        // ambient color
+            double gloss = 32.;           // specular gloss
+
+            // simple blinn phong lighting model
+            double amb =
+                (0.7 + 0.3 * nr.y) *
+                (0.2 + 0.8 * glm::clamp(0.05 * log(trap), 0.0, 1.0));  // self occlution
+            double sdw = softshadow(pos + .001 * nr, sd, 16.);         // shadow
+            double dif = glm::clamp(glm::dot(sd, nr), 0., 1.) * sdw;   // diffuse
+            double spe = glm::pow(glm::clamp(glm::dot(nr, hal), 0., 1.), gloss) *
+                         dif;  // self shadow
+
+            vec3 lin(0.);
+            lin += ambc * (.05 + .95 * amb);  // ambient color * ambient
+            lin += sc * dif * 0.8;            // diffuse * light color * light intensity
+            col *= lin;
+
+            col = glm::pow(col, vec3(.7, .9, 1.));  // fake SSS (subsurface scattering)
+            col += spe * 0.8;                       // specular
+        }
+        //---
+
+        col = glm::clamp(glm::pow(col, vec3(.4545)), 0., 1.);  // gamma correction
+        color[i][j] += col;
+
+        //         }
+        //     }
+        // }
+    }
+
+#pragma omp parallel for schedule(dynamic) num_threads(num_threads) collapse(2)
     for (int i = 0; i < height; ++i) {
         for (int j = 0; j < width; ++j) {
-            vec4 fcol(0.);  // final color (RGBA 0 ~ 1)
-
-            // anti aliasing
-            for (int m = 0; m < AA; ++m) {
-                for (int n = 0; n < AA; ++n) {
-                    vec2 p = vec2(j, i) + vec2(m, n) / (double)AA;
-
-                    //---convert screen space coordinate to (-ap~ap, -1~1)
-                    // ap = aspect ratio = width/height
-                    vec2 uv = (-iResolution.xy() + 2. * p) / iResolution.y;
-                    uv.y *= -1;  // flip upside down
-                    //---
-
-                    //---create camera
-                    vec3 ro = camera_pos;               // ray (camera) origin
-                    vec3 ta = target_pos;               // target position
-                    vec3 cf = glm::normalize(ta - ro);  // forward vector
-                    vec3 cs =
-                        glm::normalize(glm::cross(cf, vec3(0., 1., 0.)));        // right (side) vector
-                    vec3 cu = glm::normalize(glm::cross(cs, cf));                // up vector
-                    vec3 rd = glm::normalize(uv.x * cs + uv.y * cu + FOV * cf);  // ray direction
-                    //---
-
-                    //---marching
-                    double trap;  // orbit trap
-                    int objID;    // the object id intersected with
-                    double d = trace(ro, rd, trap, objID);
-                    //---
-
-                    //---lighting
-                    vec3 col(0.);                          // color
-                    vec3 sd = glm::normalize(camera_pos);  // sun direction (directional light)
-                    vec3 sc = vec3(1., .9, .717);          // light color
-                    //---
-
-                    //---coloring
-                    if (d < 0.) {        // miss (hit sky)
-                        col = vec3(0.);  // sky color (black)
-                    } else {
-                        vec3 pos = ro + rd * d;              // hit position
-                        vec3 nr = calcNor(pos);              // get surface normal
-                        vec3 hal = glm::normalize(sd - rd);  // blinn-phong lighting model (vector
-                                                             // h)
-                        // for more info:
-                        // https://en.wikipedia.org/wiki/Blinn%E2%80%93Phong_shading_model
-
-                        // use orbit trap to get the color
-                        col = pal(trap - .4, vec3(.5), vec3(.5), vec3(1.),
-                                  vec3(.0, .1, .2));  // diffuse color
-                        vec3 ambc = vec3(0.3);        // ambient color
-                        double gloss = 32.;           // specular gloss
-
-                        // simple blinn phong lighting model
-                        double amb =
-                            (0.7 + 0.3 * nr.y) *
-                            (0.2 + 0.8 * glm::clamp(0.05 * log(trap), 0.0, 1.0));  // self occlution
-                        double sdw = softshadow(pos + .001 * nr, sd, 16.);         // shadow
-                        double dif = glm::clamp(glm::dot(sd, nr), 0., 1.) * sdw;   // diffuse
-                        double spe = glm::pow(glm::clamp(glm::dot(nr, hal), 0., 1.), gloss) *
-                                     dif;  // self shadow
-
-                        vec3 lin(0.);
-                        lin += ambc * (.05 + .95 * amb);  // ambient color * ambient
-                        lin += sc * dif * 0.8;            // diffuse * light color * light intensity
-                        col *= lin;
-
-                        col = glm::pow(col, vec3(.7, .9, 1.));  // fake SSS (subsurface scattering)
-                        col += spe * 0.8;                       // specular
-                    }
-                    //---
-
-                    col = glm::clamp(glm::pow(col, vec3(.4545)), 0., 1.);  // gamma correction
-                    fcol += vec4(col, 1.);
-                }
-            }
-
-            fcol /= (double)(AA * AA);
+            color[i][j] /= (double)(AA * AA);
             // convert double (0~1) to unsigned char (0~255)
-            fcol *= 255.0;
-            image[i][4 * j + 0] = (unsigned char)fcol.r;  // r
-            image[i][4 * j + 1] = (unsigned char)fcol.g;  // g
-            image[i][4 * j + 2] = (unsigned char)fcol.b;  // b
-            image[i][4 * j + 3] = 255;                    // a
+            color[i][j] *= 255.0;
+            image[i][4 * j + 0] = (unsigned char)color[i][j].r;  // r
+            image[i][4 * j + 1] = (unsigned char)color[i][j].g;  // g
+            image[i][4 * j + 2] = (unsigned char)color[i][j].b;  // b
+            image[i][4 * j + 3] = 255;                           // a
 
             current_pixel++;
             // print progress
-            printf("rendering...%5.2lf%%\r", current_pixel / total_pixel * 100.);
+            if (world_rank == 0)
+                printf("rendering...%5.2lf%%\r", current_pixel / total_pixel * 100.);
         }
     }
+    MPI_Finalize();
     //---
 
     //---saving image
@@ -287,6 +326,8 @@ int main(int argc, char** argv) {
     return 0;
 }
 /*
+    time ./hw2 2 0 0 0 0 0 0 64 64 output/01.png
+
     time timeout 5 srun -n3 -c4 ./hw2 2 -0.522 2.874 1.340 0 0 0 64 64 output/01.png
     time timeout 15 srun -n3 -c4 ./hw2 2 4.152 2.398 -2.601 0 0 0 128 128 output/02.png
     time timeout 150 srun -n2 -c12 ./hw2 2 1.885 -1.570 3.213 0 0 0 512 512 output/03.png
@@ -295,4 +336,6 @@ int main(int argc, char** argv) {
     time timeout 180 srun -n4 -c12 ./hw2 4 0.7725 -0.385 1.3065 0.782 -0.178 0.312 1024 1024 output/06.png
     time timeout 180 srun -n4 -c12 ./hw2 4 1.1187 -1.234 -0.285 -0.282 -0.312 -0.378 1024 1024 output/07.png
     time timeout 210 srun -n4 -c12 ./hw2 4 1.1645 2.0475 1.7305 -0.8492 -1.8767 -1.00928 1536 1536 output/08.png
+
+    time srun -n4 -c12 ./hw2 6 2 2 2 0 0 0 1920 1080 output/test.png
  */
