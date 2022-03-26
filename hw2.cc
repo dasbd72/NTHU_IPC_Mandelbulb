@@ -2,11 +2,11 @@
 #include <mpi.h>
 #include <omp.h>
 
-#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 
 #define GLM_FORCE_SWIZZLE  // vec3.xyz(), vec3.xyx() ...ect, these are called "Swizzle".
 // https://glm.g-truc.net/0.9.1/api/a00002.html
@@ -182,10 +182,9 @@ int main(int argc, char** argv) {
     iResolution = vec2(width, height);
 
     tasks = new unsigned int[total_tasks];
-    for (int pix = 0; pix < total_tasks; pix++) tasks[pix] = pix;
-    std::random_shuffle(tasks, tasks + total_tasks);
     //---
-
+    // clock_t start_time, end_time;
+    // start_time = clock();
     //---MPI tasks
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
@@ -194,11 +193,15 @@ int main(int argc, char** argv) {
     partial_tasks = total_tasks / world_size;
     start = new unsigned int[world_size];
     end = new unsigned int[world_size];
-    for (int idx = 0; idx < world_size; idx++) {
-        start[idx] = idx * partial_tasks;
-        end[idx] = (idx == world_size - 1 ? total_tasks : ((idx + 1) * partial_tasks));
-        if (world_rank == 0)
-            printf("rank %d : (%u, %u)\n", idx, start[idx], end[idx]);
+    for (int ti = 0, idx = 0; idx < world_size; idx++) {
+        // start[idx] = idx * partial_tasks;
+        // end[idx] = (idx == world_size - 1 ? total_tasks : ((idx + 1) * partial_tasks));
+        start[idx] = ti;
+        for (int t = idx; t < total_tasks; t += world_size)
+            tasks[ti++] = t;
+        end[idx] = ti;
+        // if (world_rank == 0)
+        //     printf("rank %d : (%u, %u)\n", idx, start[idx], end[idx]);
     }
     //---
 
@@ -206,6 +209,7 @@ int main(int argc, char** argv) {
     raw_image = new unsigned char[width * height * 4];
     image = new unsigned char*[height];
 
+#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
     for (int i = 0; i < height; ++i) {
         image[i] = raw_image + i * width * 4;
     }
@@ -215,6 +219,7 @@ int main(int argc, char** argv) {
     raw_shuffled_image = new unsigned char[width * height * 4];
     shuffled_image = new unsigned char*[height];
 
+#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
     for (int i = 0; i < height; ++i) {
         shuffled_image[i] = raw_shuffled_image + i * width * 4;
     }
@@ -224,6 +229,7 @@ int main(int argc, char** argv) {
     raw_color = new vec3[width * height];
     color = new vec3*[height];
 
+#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
     for (int i = 0; i < height; ++i) {
         color[i] = raw_color + i * width;
     }
@@ -326,6 +332,8 @@ int main(int argc, char** argv) {
         shuffled_image[i][4 * j + 2] = (unsigned char)color[io][jo].b;  // b
         shuffled_image[i][4 * j + 3] = 255;                             // a
     }
+    // end_time = clock();
+    // printf("rank %d : %lf\n", world_rank, (double)(end_time - start_time) * 1000 / CLOCKS_PER_SEC);
 
     if (world_rank == 0) {
         for (int idx = 1; idx < world_size; idx++) {
