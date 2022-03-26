@@ -50,10 +50,10 @@ vec3 target_pos;  // target position in 3D space (x, y, z)
 unsigned char* raw_image;  // 1D image
 unsigned char** image;     // 2D image
 
-unsigned char* raw_shuffled_image;
-unsigned char** shuffled_image;
-vec3* raw_color;
-vec3** color;
+double* raw_color;
+double** color;
+double* raw_global_color;
+double** global_color;
 unsigned int total_tasks;
 unsigned int partial_tasks;
 unsigned int* tasks;
@@ -194,8 +194,6 @@ int main(int argc, char** argv) {
     start = new unsigned int[world_size];
     end = new unsigned int[world_size];
     for (int ti = 0, idx = 0; idx < world_size; idx++) {
-        // start[idx] = idx * partial_tasks;
-        // end[idx] = (idx == world_size - 1 ? total_tasks : ((idx + 1) * partial_tasks));
         start[idx] = ti;
         for (int t = idx; t < total_tasks; t += world_size)
             tasks[ti++] = t;
@@ -208,30 +206,27 @@ int main(int argc, char** argv) {
     //---create image
     raw_image = new unsigned char[width * height * 4];
     image = new unsigned char*[height];
-
 #pragma omp parallel for schedule(dynamic) num_threads(num_threads)
     for (int i = 0; i < height; ++i) {
         image[i] = raw_image + i * width * 4;
     }
     //---
 
-    //---create image
-    raw_shuffled_image = new unsigned char[width * height * 4];
-    shuffled_image = new unsigned char*[height];
-
+    //---create color
+    raw_color = new double[width * height * 4];
+    color = new double*[height];
 #pragma omp parallel for schedule(dynamic) num_threads(num_threads)
     for (int i = 0; i < height; ++i) {
-        shuffled_image[i] = raw_shuffled_image + i * width * 4;
+        color[i] = raw_color + i * width * 4;
     }
     //---
 
-    //---create color
-    raw_color = new vec3[width * height];
-    color = new vec3*[height];
-
+    //---create global color
+    raw_global_color = new double[width * height * 4];
+    global_color = new double*[height];
 #pragma omp parallel for schedule(dynamic) num_threads(num_threads)
     for (int i = 0; i < height; ++i) {
-        color[i] = raw_color + i * width;
+        global_color[i] = raw_global_color + i * width * 4;
     }
     //---
 
@@ -312,58 +307,39 @@ int main(int argc, char** argv) {
                 //---
 
                 col = glm::clamp(glm::pow(col, vec3(.4545)), 0., 1.);  // gamma correction
+
 #pragma omp critical
-                color[i][j] += col;
+                {
+                    color[i][4 * j + 0] += col.r;
+                    color[i][4 * j + 1] += col.g;
+                    color[i][4 * j + 2] += col.b;
+                    color[i][4 * j + 3] += 1;
+                }
             }
         }
     }
-#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
-    for (int pix = start[world_rank]; pix < end[world_rank]; ++pix) {
-        int i = pix / width;
-        int j = pix % width;
-        int io = tasks[pix] / width;
-        int jo = tasks[pix] % width;
+    //---
 
-        color[io][jo] /= (double)(AA * AA);
-        // convert double (0~1) to unsigned char (0~255)
-        color[io][jo] *= 255.0;
-        shuffled_image[i][4 * j + 0] = (unsigned char)color[io][jo].r;  // r
-        shuffled_image[i][4 * j + 1] = (unsigned char)color[io][jo].g;  // g
-        shuffled_image[i][4 * j + 2] = (unsigned char)color[io][jo].b;  // b
-        shuffled_image[i][4 * j + 3] = 255;                             // a
-    }
-    // end_time = clock();
-    // printf("rank %d : %lf\n", world_rank, (double)(end_time - start_time) * 1000 / CLOCKS_PER_SEC);
+    MPI_Reduce(raw_color, raw_global_color, height * width * 4, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Finalize();
 
     if (world_rank == 0) {
-        for (int idx = 1; idx < world_size; idx++) {
-            MPI_Recv(raw_shuffled_image + start[idx] * 4, end[idx] * 4 - start[idx] * 4, MPI_UNSIGNED_CHAR, idx, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+#pragma omp parallel for schedule(dynamic) num_threads(num_threads) collapse(3)
+        for (int i = 0; i < height; ++i) {
+            for (int j = 0; j < width; ++j) {
+                for (int c = 0; c < 4; ++c) {
+                    global_color[i][4 * j + c] /= (double)(AA * AA);
+                    global_color[i][4 * j + c] *= 255.0;
+                    image[i][4 * j + c] = (unsigned char)global_color[i][4 * j + c];  // rgba
+                }
+            }
         }
-    } else {
-        MPI_Send(raw_shuffled_image + start[world_rank] * 4, end[world_rank] * 4 - start[world_rank] * 4, MPI_UNSIGNED_CHAR, 0, 0, MPI_COMM_WORLD);
     }
 
-    MPI_Finalize();
-    //---
-
-    //---turn shuffled image to real image
-    if (world_rank == 0)
-#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
-        for (int pix = 0; pix < total_tasks; ++pix) {
-            int io = pix / width;
-            int jo = pix % width;
-            int i = tasks[pix] / width;
-            int j = tasks[pix] % width;
-            image[i][4 * j + 0] = shuffled_image[io][4 * jo + 0];
-            image[i][4 * j + 1] = shuffled_image[io][4 * jo + 1];
-            image[i][4 * j + 2] = shuffled_image[io][4 * jo + 2];
-            image[i][4 * j + 3] = shuffled_image[io][4 * jo + 3];
-        }
-    //---
-
     //---saving image
-    if (world_rank == 0)
+    if (world_rank == 0) {
         write_png(argv[10]);
+    }
     //---
 
     //---finalize
@@ -371,8 +347,8 @@ int main(int argc, char** argv) {
     delete[] image;
     delete[] raw_color;
     delete[] color;
-    delete[] raw_shuffled_image;
-    delete[] shuffled_image;
+    delete[] raw_global_color;
+    delete[] global_color;
     delete[] tasks;
     delete[] start;
     delete[] end;
