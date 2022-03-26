@@ -2,6 +2,7 @@
 #include <mpi.h>
 #include <omp.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -48,8 +49,13 @@ vec3 target_pos;  // target position in 3D space (x, y, z)
 
 unsigned char* raw_image;  // 1D image
 unsigned char** image;     // 2D image
+
 vec3* raw_color;
 vec3** color;
+unsigned int total_tasks;
+unsigned int partial_tasks;
+unsigned int* start;
+unsigned int* end;
 
 // save raw_image to PNG file
 void write_png(const char* filename) {
@@ -173,20 +179,27 @@ int main(int argc, char** argv) {
     assert(argc == 11);
 
     //---init arguments
-    MPI_Init(&argc, &argv);
-    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
     num_threads = atoi(argv[1]);
     camera_pos = vec3(atof(argv[2]), atof(argv[3]), atof(argv[4]));
     target_pos = vec3(atof(argv[5]), atof(argv[6]), atof(argv[7]));
     width = atoi(argv[8]);
     height = atoi(argv[9]);
-
-    double total_pixel = width * height;
-    double current_pixel = 0;
-    unsigned int total_tasks = width * height * AA * AA;
-
+    total_tasks = width * height;
     iResolution = vec2(width, height);
+    //---
+
+    //---MPI tasks
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+    partial_tasks = total_tasks / world_size;
+    start = new unsigned int[world_size];
+    end = new unsigned int[world_size];
+    for (int idx = 0; idx < world_size; idx++) {
+        start[idx] = idx * partial_tasks;
+        end[idx] = (idx == world_size - 1 ? total_tasks : ((idx + 1) * partial_tasks));
+    }
     //---
 
     //---create image
@@ -209,17 +222,13 @@ int main(int argc, char** argv) {
 
     //---start rendering
 
-// #pragma omp parallel for schedule(dynamic) num_threads(num_threads) collapse(4)
-//     for (int i = 0; i < height; ++i) {
-//         for (int j = 0; j < width; ++j) {
-//             for (int m = 0; m < AA; ++m) {
-//                 for (int n = 0; n < AA; ++n) {
 #pragma omp parallel for schedule(dynamic) num_threads(num_threads)
-    for (int iter = 0; iter < total_tasks; ++iter) {
+    for (int iter = start[world_rank] * AA * AA; iter < end[world_rank] * AA * AA; ++iter) {
         int i = (iter / (AA * AA)) / width;
         int j = (iter / (AA * AA)) % width;
         int m = (iter % (AA * AA)) / AA;
-        int n = (iter % (AA * AA)) % AA;
+        int n = iter % AA;
+
         vec2 p = vec2(j, i) + vec2(m, n) / (double)AA;
 
         //---convert screen space coordinate to (-ap~ap, -1~1)
@@ -288,54 +297,59 @@ int main(int argc, char** argv) {
 
         col = glm::clamp(glm::pow(col, vec3(.4545)), 0., 1.);  // gamma correction
         color[i][j] += col;
-
-        //         }
-        //     }
-        // }
+    }
+#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
+    for (int pix = start[world_rank]; pix < end[world_rank]; ++pix) {
+        int i = pix / width;
+        int j = pix % width;
+        color[i][j] /= (double)(AA * AA);
+        // convert double (0~1) to unsigned char (0~255)
+        color[i][j] *= 255.0;
+        image[i][4 * j + 0] = (unsigned char)color[i][j].r;  // r
+        image[i][4 * j + 1] = (unsigned char)color[i][j].g;  // g
+        image[i][4 * j + 2] = (unsigned char)color[i][j].b;  // b
+        image[i][4 * j + 3] = 255;                           // a
     }
 
-#pragma omp parallel for schedule(dynamic) num_threads(num_threads) collapse(2)
-    for (int i = 0; i < height; ++i) {
-        for (int j = 0; j < width; ++j) {
-            color[i][j] /= (double)(AA * AA);
-            // convert double (0~1) to unsigned char (0~255)
-            color[i][j] *= 255.0;
-            image[i][4 * j + 0] = (unsigned char)color[i][j].r;  // r
-            image[i][4 * j + 1] = (unsigned char)color[i][j].g;  // g
-            image[i][4 * j + 2] = (unsigned char)color[i][j].b;  // b
-            image[i][4 * j + 3] = 255;                           // a
-
-            current_pixel++;
-            // print progress
-            if (world_rank == 0)
-                printf("rendering...%5.2lf%%\r", current_pixel / total_pixel * 100.);
+    // MPI_Gather(raw_image + start, end - start + 1, MPI_UNSIGNED_CHAR, raw_image + start, end - start + 1, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD);
+    if (world_rank == 0) {
+        for (int idx = 1; idx < world_size; idx++) {
+            MPI_Recv(raw_image + start[idx] * 4, end[idx] * 4 - start[idx] * 4 + 1, MPI_UNSIGNED_CHAR, idx, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         }
+    } else {
+        MPI_Send(raw_image + start[world_rank] * 4, end[world_rank] * 4 - start[world_rank] * 4 + 1, MPI_UNSIGNED_CHAR, 0, 0, MPI_COMM_WORLD);
     }
+
     MPI_Finalize();
     //---
 
     //---saving image
-    write_png(argv[10]);
+    if (world_rank == 0)
+        write_png(argv[10]);
     //---
 
     //---finalize
     delete[] raw_image;
     delete[] image;
+    delete[] raw_color;
+    delete[] color;
+    delete[] start;
+    delete[] end;
     //---
 
     return 0;
 }
 /*
-    time ./hw2 2 0 0 0 0 0 0 64 64 output/01.png
+    make;time ./hw2 1 0 0 0 0 0 0 64 64 output/test.png
 
-    time timeout 5 srun -n3 -c4 ./hw2 2 -0.522 2.874 1.340 0 0 0 64 64 output/01.png
-    time timeout 15 srun -n3 -c4 ./hw2 2 4.152 2.398 -2.601 0 0 0 128 128 output/02.png
-    time timeout 150 srun -n2 -c12 ./hw2 2 1.885 -1.570 3.213 0 0 0 512 512 output/03.png
-    time timeout 250 srun -n6 -c6 ./hw2 3 -0.027 -0.097 3.044 0 0 0 512 512 output/04.png
-    time timeout 150 srun -n4 -c6 ./hw2 2 3.726 0.511 -0.096 0 0 0 512 512 output/05.png
-    time timeout 180 srun -n4 -c12 ./hw2 4 0.7725 -0.385 1.3065 0.782 -0.178 0.312 1024 1024 output/06.png
-    time timeout 180 srun -n4 -c12 ./hw2 4 1.1187 -1.234 -0.285 -0.282 -0.312 -0.378 1024 1024 output/07.png
-    time timeout 210 srun -n4 -c12 ./hw2 4 1.1645 2.0475 1.7305 -0.8492 -1.8767 -1.00928 1536 1536 output/08.png
+    make;time timeout 5 srun -n3 -c4 ./hw2 4 -0.522 2.874 1.340 0 0 0 64 64 output/01.png
+    make;time timeout 15 srun -n3 -c4 ./hw2 4 4.152 2.398 -2.601 0 0 0 128 128 output/02.png
+    make;time timeout 150 srun -n2 -c12 ./hw2 12 1.885 -1.570 3.213 0 0 0 512 512 output/03.png
+    make;time timeout 250 srun -n6 -c6 ./hw2 6 -0.027 -0.097 3.044 0 0 0 512 512 output/04.png
+    make;time timeout 150 srun -n4 -c6 ./hw2 6 3.726 0.511 -0.096 0 0 0 512 512 output/05.png
+    make;time timeout 180 srun -n4 -c12 ./hw2 12 0.7725 -0.385 1.3065 0.782 -0.178 0.312 1024 1024 output/06.png
+    make;time timeout 180 srun -n4 -c12 ./hw2 12 1.1187 -1.234 -0.285 -0.282 -0.312 -0.378 1024 1024 output/07.png
+    make;time timeout 210 srun -n4 -c12 ./hw2 12 1.1645 2.0475 1.7305 -0.8492 -1.8767 -1.00928 1536 1536 output/08.png
 
-    time srun -n4 -c12 ./hw2 6 2 2 2 0 0 0 1920 1080 output/test.png
+    make;time srun -n4 -c12 ./hw2 6 2 2 2 0 0 0 1920 1080 output/test.png
  */
