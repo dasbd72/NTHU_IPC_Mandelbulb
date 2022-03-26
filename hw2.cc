@@ -50,10 +50,13 @@ vec3 target_pos;  // target position in 3D space (x, y, z)
 unsigned char* raw_image;  // 1D image
 unsigned char** image;     // 2D image
 
+unsigned char* raw_shuffled_image;
+unsigned char** shuffled_image;
 vec3* raw_color;
 vec3** color;
 unsigned int total_tasks;
 unsigned int partial_tasks;
+unsigned int* tasks;
 unsigned int* start;
 unsigned int* end;
 
@@ -161,15 +164,6 @@ double trace(vec3 ro, vec3 rd, double& trap, int& ID) {
 }
 
 int main(int argc, char** argv) {
-    // test
-    /*
-    vec3 col(0.);
-    printf("%lf %lf %lf\n", col.x, col.y, col.x);
-    col = glm::clamp(glm::pow(col, vec3(.4545)), 0., 1.);
-    printf("%lf %lf %lf\n", col.x, col.y, col.x);
-    exit(0);
-    */
-
     // ./source [num_threads] [x1] [y1] [z1] [x2] [y2] [z2] [width] [height] [filename]
     // num_threads: number of threads per process
     // x1 y1 z1: camera position in 3D space
@@ -186,6 +180,10 @@ int main(int argc, char** argv) {
     height = atoi(argv[9]);
     total_tasks = width * height;
     iResolution = vec2(width, height);
+
+    tasks = new unsigned int[total_tasks];
+    for (int pix = 0; pix < total_tasks; pix++) tasks[pix] = pix;
+    std::random_shuffle(tasks, tasks + total_tasks);
     //---
 
     //---MPI tasks
@@ -199,6 +197,8 @@ int main(int argc, char** argv) {
     for (int idx = 0; idx < world_size; idx++) {
         start[idx] = idx * partial_tasks;
         end[idx] = (idx == world_size - 1 ? total_tasks : ((idx + 1) * partial_tasks));
+        if (world_rank == 0)
+            printf("rank %d : (%u, %u)\n", idx, start[idx], end[idx]);
     }
     //---
 
@@ -208,6 +208,15 @@ int main(int argc, char** argv) {
 
     for (int i = 0; i < height; ++i) {
         image[i] = raw_image + i * width * 4;
+    }
+    //---
+
+    //---create image
+    raw_shuffled_image = new unsigned char[width * height * 4];
+    shuffled_image = new unsigned char*[height];
+
+    for (int i = 0; i < height; ++i) {
+        shuffled_image[i] = raw_shuffled_image + i * width * 4;
     }
     //---
 
@@ -223,104 +232,125 @@ int main(int argc, char** argv) {
     //---start rendering
 
 #pragma omp parallel for schedule(dynamic) num_threads(num_threads)
-    for (int iter = start[world_rank] * AA * AA; iter < end[world_rank] * AA * AA; ++iter) {
-        int i = (iter / (AA * AA)) / width;
-        int j = (iter / (AA * AA)) % width;
-        int m = (iter % (AA * AA)) / AA;
-        int n = iter % AA;
+    for (int iter = start[world_rank]; iter < end[world_rank]; ++iter) {
+        for (int m = 0; m < AA; m++) {
+            for (int n = 0; n < AA; n++) {
+                // int i = iter / width;
+                // int j = iter % width;
+                int i = tasks[iter] / width;
+                int j = tasks[iter] % width;
+                vec2 p = vec2(j, i) + vec2(m, n) / (double)AA;
 
-        vec2 p = vec2(j, i) + vec2(m, n) / (double)AA;
+                //---convert screen space coordinate to (-ap~ap, -1~1)
+                // ap = aspect ratio = width/height
+                vec2 uv = (-iResolution.xy() + 2. * p) / iResolution.y;
+                uv.y *= -1;  // flip upside down
+                //---
 
-        //---convert screen space coordinate to (-ap~ap, -1~1)
-        // ap = aspect ratio = width/height
-        vec2 uv = (-iResolution.xy() + 2. * p) / iResolution.y;
-        uv.y *= -1;  // flip upside down
-        //---
+                //---create camera
+                vec3 ro = camera_pos;               // ray (camera) origin
+                vec3 ta = target_pos;               // target position
+                vec3 cf = glm::normalize(ta - ro);  // forward vector
+                vec3 cs =
+                    glm::normalize(glm::cross(cf, vec3(0., 1., 0.)));        // right (side) vector
+                vec3 cu = glm::normalize(glm::cross(cs, cf));                // up vector
+                vec3 rd = glm::normalize(uv.x * cs + uv.y * cu + FOV * cf);  // ray direction
+                //---
 
-        //---create camera
-        vec3 ro = camera_pos;               // ray (camera) origin
-        vec3 ta = target_pos;               // target position
-        vec3 cf = glm::normalize(ta - ro);  // forward vector
-        vec3 cs =
-            glm::normalize(glm::cross(cf, vec3(0., 1., 0.)));        // right (side) vector
-        vec3 cu = glm::normalize(glm::cross(cs, cf));                // up vector
-        vec3 rd = glm::normalize(uv.x * cs + uv.y * cu + FOV * cf);  // ray direction
-        //---
+                //---marching
+                double trap;  // orbit trap
+                int objID;    // the object id intersected with
+                double d = trace(ro, rd, trap, objID);
+                //---
 
-        //---marching
-        double trap;  // orbit trap
-        int objID;    // the object id intersected with
-        double d = trace(ro, rd, trap, objID);
-        //---
+                //---lighting
+                vec3 col(0.);                          // color
+                vec3 sd = glm::normalize(camera_pos);  // sun direction (directional light)
+                vec3 sc = vec3(1., .9, .717);          // light color
+                //---
 
-        //---lighting
-        vec3 col(0.);                          // color
-        vec3 sd = glm::normalize(camera_pos);  // sun direction (directional light)
-        vec3 sc = vec3(1., .9, .717);          // light color
-        //---
+                //---coloring
+                if (d < 0.) {        // miss (hit sky)
+                    col = vec3(0.);  // sky color (black)
+                } else {
+                    vec3 pos = ro + rd * d;              // hit position
+                    vec3 nr = calcNor(pos);              // get surface normal
+                    vec3 hal = glm::normalize(sd - rd);  // blinn-phong lighting model (vector
+                                                         // h)
+                    // for more info:
+                    // https://en.wikipedia.org/wiki/Blinn%E2%80%93Phong_shading_model
 
-        //---coloring
-        if (d < 0.) {        // miss (hit sky)
-            col = vec3(0.);  // sky color (black)
-        } else {
-            vec3 pos = ro + rd * d;              // hit position
-            vec3 nr = calcNor(pos);              // get surface normal
-            vec3 hal = glm::normalize(sd - rd);  // blinn-phong lighting model (vector
-                                                 // h)
-            // for more info:
-            // https://en.wikipedia.org/wiki/Blinn%E2%80%93Phong_shading_model
+                    // use orbit trap to get the color
+                    col = pal(trap - .4, vec3(.5), vec3(.5), vec3(1.),
+                              vec3(.0, .1, .2));  // diffuse color
+                    vec3 ambc = vec3(0.3);        // ambient color
+                    double gloss = 32.;           // specular gloss
 
-            // use orbit trap to get the color
-            col = pal(trap - .4, vec3(.5), vec3(.5), vec3(1.),
-                      vec3(.0, .1, .2));  // diffuse color
-            vec3 ambc = vec3(0.3);        // ambient color
-            double gloss = 32.;           // specular gloss
+                    // simple blinn phong lighting model
+                    double amb =
+                        (0.7 + 0.3 * nr.y) *
+                        (0.2 + 0.8 * glm::clamp(0.05 * log(trap), 0.0, 1.0));  // self occlution
+                    double sdw = softshadow(pos + .001 * nr, sd, 16.);         // shadow
+                    double dif = glm::clamp(glm::dot(sd, nr), 0., 1.) * sdw;   // diffuse
+                    double spe = glm::pow(glm::clamp(glm::dot(nr, hal), 0., 1.), gloss) *
+                                 dif;  // self shadow
 
-            // simple blinn phong lighting model
-            double amb =
-                (0.7 + 0.3 * nr.y) *
-                (0.2 + 0.8 * glm::clamp(0.05 * log(trap), 0.0, 1.0));  // self occlution
-            double sdw = softshadow(pos + .001 * nr, sd, 16.);         // shadow
-            double dif = glm::clamp(glm::dot(sd, nr), 0., 1.) * sdw;   // diffuse
-            double spe = glm::pow(glm::clamp(glm::dot(nr, hal), 0., 1.), gloss) *
-                         dif;  // self shadow
+                    vec3 lin(0.);
+                    lin += ambc * (.05 + .95 * amb);  // ambient color * ambient
+                    lin += sc * dif * 0.8;            // diffuse * light color * light intensity
+                    col *= lin;
 
-            vec3 lin(0.);
-            lin += ambc * (.05 + .95 * amb);  // ambient color * ambient
-            lin += sc * dif * 0.8;            // diffuse * light color * light intensity
-            col *= lin;
+                    col = glm::pow(col, vec3(.7, .9, 1.));  // fake SSS (subsurface scattering)
+                    col += spe * 0.8;                       // specular
+                }
+                //---
 
-            col = glm::pow(col, vec3(.7, .9, 1.));  // fake SSS (subsurface scattering)
-            col += spe * 0.8;                       // specular
+                col = glm::clamp(glm::pow(col, vec3(.4545)), 0., 1.);  // gamma correction
+#pragma omp critical
+                color[i][j] += col;
+            }
         }
-        //---
-
-        col = glm::clamp(glm::pow(col, vec3(.4545)), 0., 1.);  // gamma correction
-        color[i][j] += col;
     }
 #pragma omp parallel for schedule(dynamic) num_threads(num_threads)
     for (int pix = start[world_rank]; pix < end[world_rank]; ++pix) {
         int i = pix / width;
         int j = pix % width;
-        color[i][j] /= (double)(AA * AA);
+        int io = tasks[pix] / width;
+        int jo = tasks[pix] % width;
+
+        color[io][jo] /= (double)(AA * AA);
         // convert double (0~1) to unsigned char (0~255)
-        color[i][j] *= 255.0;
-        image[i][4 * j + 0] = (unsigned char)color[i][j].r;  // r
-        image[i][4 * j + 1] = (unsigned char)color[i][j].g;  // g
-        image[i][4 * j + 2] = (unsigned char)color[i][j].b;  // b
-        image[i][4 * j + 3] = 255;                           // a
+        color[io][jo] *= 255.0;
+        shuffled_image[i][4 * j + 0] = (unsigned char)color[io][jo].r;  // r
+        shuffled_image[i][4 * j + 1] = (unsigned char)color[io][jo].g;  // g
+        shuffled_image[i][4 * j + 2] = (unsigned char)color[io][jo].b;  // b
+        shuffled_image[i][4 * j + 3] = 255;                             // a
     }
 
-    // MPI_Gather(raw_image + start, end - start + 1, MPI_UNSIGNED_CHAR, raw_image + start, end - start + 1, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD);
     if (world_rank == 0) {
         for (int idx = 1; idx < world_size; idx++) {
-            MPI_Recv(raw_image + start[idx] * 4, end[idx] * 4 - start[idx] * 4 + 1, MPI_UNSIGNED_CHAR, idx, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Recv(raw_shuffled_image + start[idx] * 4, end[idx] * 4 - start[idx] * 4, MPI_UNSIGNED_CHAR, idx, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         }
     } else {
-        MPI_Send(raw_image + start[world_rank] * 4, end[world_rank] * 4 - start[world_rank] * 4 + 1, MPI_UNSIGNED_CHAR, 0, 0, MPI_COMM_WORLD);
+        MPI_Send(raw_shuffled_image + start[world_rank] * 4, end[world_rank] * 4 - start[world_rank] * 4, MPI_UNSIGNED_CHAR, 0, 0, MPI_COMM_WORLD);
     }
 
     MPI_Finalize();
+    //---
+
+    //---turn shuffled image to real image
+    if (world_rank == 0)
+#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
+        for (int pix = 0; pix < total_tasks; ++pix) {
+            int io = pix / width;
+            int jo = pix % width;
+            int i = tasks[pix] / width;
+            int j = tasks[pix] % width;
+            image[i][4 * j + 0] = shuffled_image[io][4 * jo + 0];
+            image[i][4 * j + 1] = shuffled_image[io][4 * jo + 1];
+            image[i][4 * j + 2] = shuffled_image[io][4 * jo + 2];
+            image[i][4 * j + 3] = shuffled_image[io][4 * jo + 3];
+        }
     //---
 
     //---saving image
@@ -333,6 +363,9 @@ int main(int argc, char** argv) {
     delete[] image;
     delete[] raw_color;
     delete[] color;
+    delete[] raw_shuffled_image;
+    delete[] shuffled_image;
+    delete[] tasks;
     delete[] start;
     delete[] end;
     //---
@@ -340,16 +373,16 @@ int main(int argc, char** argv) {
     return 0;
 }
 /*
-    make;time ./hw2 1 0 0 0 0 0 0 64 64 output/test.png
+make;time ./hw2 1 0 0 0 0 0 0 64 64 output/test.png
 
-    make;time timeout 5 srun -n3 -c4 ./hw2 4 -0.522 2.874 1.340 0 0 0 64 64 output/01.png
-    make;time timeout 15 srun -n3 -c4 ./hw2 4 4.152 2.398 -2.601 0 0 0 128 128 output/02.png
-    make;time timeout 150 srun -n2 -c12 ./hw2 12 1.885 -1.570 3.213 0 0 0 512 512 output/03.png
-    make;time timeout 250 srun -n6 -c6 ./hw2 6 -0.027 -0.097 3.044 0 0 0 512 512 output/04.png
-    make;time timeout 150 srun -n4 -c6 ./hw2 6 3.726 0.511 -0.096 0 0 0 512 512 output/05.png
-    make;time timeout 180 srun -n4 -c12 ./hw2 12 0.7725 -0.385 1.3065 0.782 -0.178 0.312 1024 1024 output/06.png
-    make;time timeout 180 srun -n4 -c12 ./hw2 12 1.1187 -1.234 -0.285 -0.282 -0.312 -0.378 1024 1024 output/07.png
-    make;time timeout 210 srun -n4 -c12 ./hw2 12 1.1645 2.0475 1.7305 -0.8492 -1.8767 -1.00928 1536 1536 output/08.png
+make;time timeout 5 srun -n3 -c4 ./hw2 4 -0.522 2.874 1.340 0 0 0 64 64 output/01.png;                                  hw2-diff output/01.png testcases/01.png
+make;time timeout 15 srun -n3 -c4 ./hw2 4 4.152 2.398 -2.601 0 0 0 128 128 output/02.png;                               hw2-diff output/02.png testcases/02.png
+make;time timeout 150 srun -n2 -c12 ./hw2 12 1.885 -1.570 3.213 0 0 0 512 512 output/03.png;                            hw2-diff output/03.png testcases/03.png
+make;time timeout 250 srun -n6 -c6 ./hw2 6 -0.027 -0.097 3.044 0 0 0 512 512 output/04.png;                             hw2-diff output/04.png testcases/04.png
+make;time timeout 150 srun -n4 -c6 ./hw2 6 3.726 0.511 -0.096 0 0 0 512 512 output/05.png;                              hw2-diff output/05.png testcases/05.png
+make;time timeout 180 srun -n4 -c12 ./hw2 12 0.7725 -0.385 1.3065 0.782 -0.178 0.312 1024 1024 output/06.png;           hw2-diff output/06.png testcases/06.png
+make;time timeout 180 srun -n4 -c12 ./hw2 12 1.1187 -1.234 -0.285 -0.282 -0.312 -0.378 1024 1024 output/07.png;         hw2-diff output/07.png testcases/07.png
+make;time timeout 210 srun -n4 -c12 ./hw2 12 1.1645 2.0475 1.7305 -0.8492 -1.8767 -1.00928 1536 1536 output/08.png;     hw2-diff output/08.png testcases/08.png
 
-    make;time srun -n4 -c12 ./hw2 6 2 2 2 0 0 0 1920 1080 output/test.png
+make;time srun -n4 -c12 ./hw2 6 2 2 2 0 0 0 1920 1080 output/test.png
  */
