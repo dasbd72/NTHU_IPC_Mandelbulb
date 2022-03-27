@@ -55,7 +55,7 @@ double* raw_local_color;
 double** local_color;
 double* raw_global_color;
 double** global_color;
-// unsigned int* tasks;
+unsigned int* tasks;
 unsigned int total_tasks;
 clock_t start_time, end_time;
 
@@ -180,9 +180,9 @@ int main(int argc, char** argv) {
     total_tasks = width * height * SQAA;
     iResolution = vec2(width, height);
 
-    // tasks = new unsigned int[total_tasks];
-    // for (int pix = 0; pix < total_tasks; ++pix) tasks[pix] = pix;
-    // std::random_shuffle(tasks, tasks + total_tasks);
+    tasks = new unsigned int[total_tasks];
+    for (int pix = 0; pix < total_tasks; ++pix) tasks[pix] = pix;
+    std::random_shuffle(tasks, tasks + total_tasks);
     //---
 
     //===MPI tasks=====================================================================================
@@ -221,7 +221,8 @@ int main(int argc, char** argv) {
 
     //---start rendering
 #pragma omp parallel for schedule(dynamic) num_threads(num_threads)
-    for (int iter = world_rank; iter < total_tasks; iter += world_size) {
+    for (int iter_idx = world_rank; iter_idx < total_tasks; iter_idx += world_size) {
+        int iter = tasks[iter_idx];
         int i = (iter >> 2) / width;
         int j = (iter >> 2) % width;
         int n = (iter & (1 << 1)) ? 1 : 0;
@@ -333,7 +334,7 @@ int main(int argc, char** argv) {
     delete[] local_color;
     delete[] raw_global_color;
     delete[] global_color;
-    // delete[] tasks;
+    delete[] tasks;
     //---
 
     return 0;
