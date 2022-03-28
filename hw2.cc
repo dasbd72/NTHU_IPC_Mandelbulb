@@ -1,6 +1,7 @@
 #include <lodepng.h>
 #include <mpi.h>
 #include <omp.h>
+#include <pthread.h>
 
 #include <algorithm>
 #include <cassert>
@@ -46,18 +47,21 @@ const double far_plane = 100.;      // scene depth
 vec3 camera_pos;  // camera position in 3D space (x, y, z)
 vec3 target_pos;  // target position in 3D space (x, y, z)
 
-unsigned char* raw_image;  // 1D image
-unsigned char** image;     // 2D image
+unsigned char* raw_image;        // 1D image
+unsigned char** image;           // 2D image
+unsigned char* raw_local_image;  // 1D image
+unsigned char** local_image;     // 2D image
 
 int world_rank;  // Mpi world_rank
 int world_size;  // Mpi world_size
-double* raw_local_color;
-double** local_color;
-double* raw_global_color;
-double** global_color;
-unsigned int* tasks;
+unsigned int* taskList;
 unsigned int total_tasks;
 clock_t start_time, end_time;
+
+pthread_mutex_t mutex;
+pthread_t* threads;
+int num_pthreads;
+int local_iter_idx;
 
 // save raw_image to PNG file
 void write_png(const char* filename) {
@@ -162,6 +166,8 @@ double trace(vec3 ro, vec3 rd, double& trap, int& ID) {
                : -1.;  // if exceeds the far plane then return -1 which means the ray missed a shot
 }
 
+void* processor(void* arg);
+
 int main(int argc, char** argv) {
     // ./source [num_threads] [x1] [y1] [z1] [x2] [y2] [z2] [width] [height] [filename]
     // num_threads: number of threads per process
@@ -173,23 +179,26 @@ int main(int argc, char** argv) {
 
     //---init arguments
     num_threads = atoi(argv[1]);
+    num_pthreads = num_threads;
     camera_pos = vec3(atof(argv[2]), atof(argv[3]), atof(argv[4]));
     target_pos = vec3(atof(argv[5]), atof(argv[6]), atof(argv[7]));
     width = atoi(argv[8]);
     height = atoi(argv[9]);
-    total_tasks = width * height * SQAA;
+    total_tasks = width * height;
     iResolution = vec2(width, height);
 
-    tasks = new unsigned int[total_tasks];
-    for (int pix = 0; pix < total_tasks; ++pix) tasks[pix] = pix;
-    std::random_shuffle(tasks, tasks + total_tasks);
+    taskList = new unsigned int[total_tasks];
+    for (int pix = 0; pix < total_tasks; ++pix) taskList[pix] = pix;
+    std::random_shuffle(taskList, taskList + total_tasks);
     //---
 
-    //===MPI tasks=====================================================================================
-    // start_time = clock();
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+    mutex = PTHREAD_MUTEX_INITIALIZER;
+    threads = new pthread_t[num_pthreads];
+    pthread_mutex_init(&mutex, NULL);
 
     //---create image
     raw_image = new unsigned char[width * height * SQAA];
@@ -200,127 +209,25 @@ int main(int argc, char** argv) {
     }
     //---
 
-    //---create local color
-    raw_local_color = new double[width * height * (SQAA - 1)];
-    memset(raw_local_color, 0, width * height * (SQAA - 1) * sizeof(double));
-    local_color = new double*[height];
+    //---create image
+    raw_local_image = new unsigned char[width * height * SQAA];
+    local_image = new unsigned char*[height];
 #pragma omp parallel for schedule(dynamic) num_threads(num_threads)
     for (int i = 0; i < height; ++i) {
-        local_color[i] = raw_local_color + i * width * (SQAA - 1);
+        local_image[i] = raw_local_image + i * width * SQAA;
     }
     //---
 
-    //---create global color
-    raw_global_color = new double[width * height * (SQAA - 1)];
-    global_color = new double*[height];
-#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
-    for (int i = 0; i < height; ++i) {
-        global_color[i] = raw_global_color + i * width * (SQAA - 1);
+    local_iter_idx = world_rank;
+    for (int pid = 0; pid < num_pthreads; ++pid) {
+        pthread_create(&threads[pid], NULL, processor, NULL);
     }
-    //---
-
-    //---start rendering
-#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
-    for (int iter_idx = world_rank; iter_idx < total_tasks; iter_idx += world_size) {
-        int iter = tasks[iter_idx];
-        int i = (iter >> 2) / width;
-        int j = (iter >> 2) % width;
-        int n = (iter & (1 << 1)) ? 1 : 0;
-        int m = (iter & 1) ? 1 : 0;
-
-        vec2 p = vec2(j, i) + vec2(m, n) / (double)AA;
-
-        vec2 uv = (-iResolution.xy() + 2. * p) / iResolution.y;
-        uv.y *= -1;  // flip upside down
-        //---
-
-        //---create camera
-        vec3 cf = glm::normalize(target_pos - camera_pos);  // forward vector
-        vec3 cs =
-            glm::normalize(glm::cross(cf, vec3(0., 1., 0.)));        // right (side) vector
-        vec3 cu = glm::normalize(glm::cross(cs, cf));                // up vector
-        vec3 rd = glm::normalize(uv.x * cs + uv.y * cu + FOV * cf);  // ray direction
-        //---
-
-        //---marching
-        double trap;  // orbit trap
-        int objID;    // the object id intersected with
-        double d = trace(camera_pos, rd, trap, objID);
-        //---
-
-        //---lighting
-        vec3 col(0.);                          // color
-        vec3 sd = glm::normalize(camera_pos);  // sun direction (directional light)
-        vec3 sc = vec3(1., .9, .717);          // light color
-        //---
-
-        //---coloring
-        if (d < 0.) {        // miss (hit sky)
-            col = vec3(0.);  // sky color (black)
-        } else {
-            vec3 pos = camera_pos + rd * d;      // hit position
-            vec3 nr = calcNor(pos);              // get surface normal
-            vec3 hal = glm::normalize(sd - rd);  // blinn-phong lighting model (vector
-                                                 // h)
-            // for more info:
-            // https://en.wikipedia.org/wiki/Blinn%E2%80%93Phong_shading_model
-
-            // use orbit trap to get the color
-            col = pal(trap - .4, vec3(.5), vec3(.5), vec3(1.),
-                      vec3(.0, .1, .2));  // diffuse color
-            vec3 ambc = vec3(0.3);        // ambient color
-            double gloss = 32.;           // specular gloss
-
-            // simple blinn phong lighting model
-            double amb =
-                (0.7 + 0.3 * nr.y) *
-                (0.2 + 0.8 * glm::clamp(0.05 * log(trap), 0.0, 1.0));  // self occlution
-            double sdw = softshadow(pos + .001 * nr, sd, 16.);         // shadow
-            double dif = glm::clamp(glm::dot(sd, nr), 0., 1.) * sdw;   // diffuse
-            double spe = glm::pow(glm::clamp(glm::dot(nr, hal), 0., 1.), gloss) *
-                         dif;  // self shadow
-
-            vec3 lin(0.);
-            lin += ambc * (.05 + .95 * amb);  // ambient color * ambient
-            lin += sc * dif * 0.8;            // diffuse * light color * light intensity
-            col *= lin;
-
-            col = glm::pow(col, vec3(.7, .9, 1.));  // fake SSS (subsurface scattering)
-            col += spe * 0.8;                       // specular
-        }
-        //---
-
-        col = glm::clamp(glm::pow(col, vec3(.4545)), 0., 1.);  // gamma correction
-
-#pragma omp critical
-        {
-            local_color[i][(SQAA - 1) * j + 0] += col.r;
-            local_color[i][(SQAA - 1) * j + 1] += col.g;
-            local_color[i][(SQAA - 1) * j + 2] += col.b;
-        }
-    }
-    //---
-
-    MPI_Reduce(raw_local_color, raw_global_color, height * width * (SQAA - 1), MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Finalize();
-    // end_time = clock();
-    // printf("Rank %d : %lf\n", world_rank, (double)(end_time - start_time) * 1000. / CLOCKS_PER_SEC);
-    //===MPI tasks=====================================================================================
-
-    if (world_rank == 0) {
-#pragma omp parallel for schedule(dynamic) num_threads(num_threads) collapse(2)
-        for (int i = 0; i < height; ++i) {
-            for (int j = 0; j < width; ++j) {
-                for (int c = 0; c < (SQAA - 1); ++c) {
-                    global_color[i][(SQAA - 1) * j + c] /= (double)(SQAA);
-                    global_color[i][(SQAA - 1) * j + c] *= 255.0;
-                    image[i][SQAA * j + c] = (unsigned char)global_color[i][(SQAA - 1) * j + c];  // rgb
-                }
-                image[i][SQAA * j + 3] = 255;  // a
-            }
-        }
+    processor(NULL);
+    for (int pid = 0; pid < num_pthreads; ++pid) {
+        pthread_join(threads[pid], 0);
     }
 
+    MPI_Reduce(raw_local_image, raw_image, height * width * SQAA, MPI_UNSIGNED_CHAR, MPI_SUM, 0, MPI_COMM_WORLD);
     //---saving image
     if (world_rank == 0) {
         write_png(argv[10]);
@@ -330,14 +237,106 @@ int main(int argc, char** argv) {
     //---finalize
     delete[] raw_image;
     delete[] image;
-    delete[] raw_local_color;
-    delete[] local_color;
-    delete[] raw_global_color;
-    delete[] global_color;
-    delete[] tasks;
+    delete[] raw_local_image;
+    delete[] local_image;
+    delete[] taskList;
+    delete[] threads;
+    pthread_mutex_destroy(&mutex);
+    MPI_Finalize();
     //---
-
     return 0;
+}
+
+void* processor(void* arg) {
+    while (1) {
+        pthread_mutex_lock(&mutex);
+        int iter_idx = local_iter_idx;
+        local_iter_idx += world_size;
+        pthread_mutex_unlock(&mutex);
+        if (iter_idx >= total_tasks)
+            break;
+        int iter = taskList[iter_idx];
+        int i = iter / width;
+        int j = iter % width;
+        vec4 fcol(0.);
+        for (int n = 0; n < AA; n++) {
+            for (int m = 0; m < AA; m++) {
+                vec2 p = vec2(j, i) + vec2(m, n) / (double)AA;
+
+                vec2 uv = (-iResolution.xy() + 2. * p) / iResolution.y;
+                uv.y *= -1;  // flip upside down
+                //---
+
+                //---create camera
+                vec3 cf = glm::normalize(target_pos - camera_pos);  // forward vector
+                vec3 cs =
+                    glm::normalize(glm::cross(cf, vec3(0., 1., 0.)));        // right (side) vector
+                vec3 cu = glm::normalize(glm::cross(cs, cf));                // up vector
+                vec3 rd = glm::normalize(uv.x * cs + uv.y * cu + FOV * cf);  // ray direction
+                //---
+
+                //---marching
+                double trap;  // orbit trap
+                int objID;    // the object id intersected with
+                double d = trace(camera_pos, rd, trap, objID);
+                //---
+
+                //---lighting
+                vec3 col(0.);                          // color
+                vec3 sd = glm::normalize(camera_pos);  // sun direction (directional light)
+                vec3 sc = vec3(1., .9, .717);          // light color
+                //---
+
+                //---coloring
+                if (d < 0.) {        // miss (hit sky)
+                    col = vec3(0.);  // sky color (black)
+                } else {
+                    vec3 pos = camera_pos + rd * d;      // hit position
+                    vec3 nr = calcNor(pos);              // get surface normal
+                    vec3 hal = glm::normalize(sd - rd);  // blinn-phong lighting model (vector
+                                                         // h)
+                    // for more info:
+                    // https://en.wikipedia.org/wiki/Blinn%E2%80%93Phong_shading_model
+
+                    // use orbit trap to get the color
+                    col = pal(trap - .4, vec3(.5), vec3(.5), vec3(1.),
+                              vec3(.0, .1, .2));  // diffuse color
+                    vec3 ambc = vec3(0.3);        // ambient color
+                    double gloss = 32.;           // specular gloss
+
+                    // simple blinn phong lighting model
+                    double amb =
+                        (0.7 + 0.3 * nr.y) *
+                        (0.2 + 0.8 * glm::clamp(0.05 * log(trap), 0.0, 1.0));  // self occlution
+                    double sdw = softshadow(pos + .001 * nr, sd, 16.);         // shadow
+                    double dif = glm::clamp(glm::dot(sd, nr), 0., 1.) * sdw;   // diffuse
+                    double spe = glm::pow(glm::clamp(glm::dot(nr, hal), 0., 1.), gloss) *
+                                 dif;  // self shadow
+
+                    vec3 lin(0.);
+                    lin += ambc * (.05 + .95 * amb);  // ambient color * ambient
+                    lin += sc * dif * 0.8;            // diffuse * light color * light intensity
+                    col *= lin;
+
+                    col = glm::pow(col, vec3(.7, .9, 1.));  // fake SSS (subsurface scattering)
+                    col += spe * 0.8;                       // specular
+                }
+                col = glm::clamp(glm::pow(col, vec3(.4545)), 0., 1.);  // gamma correction
+                //---
+                fcol += vec4(col, 1.);
+            }
+        }
+        fcol /= (double)(SQAA);
+        fcol *= 255.0;
+
+        pthread_mutex_lock(&mutex);
+        local_image[i][SQAA * j + 0] = fcol.r;
+        local_image[i][SQAA * j + 1] = fcol.g;
+        local_image[i][SQAA * j + 2] = fcol.b;
+        local_image[i][SQAA * j + 3] = 255;
+        pthread_mutex_unlock(&mutex);
+    }
+    return NULL;
 }
 /*
 make;time srun -N2 -n3 -c4 -t0:100 ./hw2 4 2 0.1 0.1 0 0 0 128 128 output/test.png;
