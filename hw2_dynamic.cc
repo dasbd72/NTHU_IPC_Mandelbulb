@@ -47,29 +47,23 @@ const double far_plane = 100.;      // scene depth
 vec3 camera_pos;  // camera position in 3D space (x, y, z)
 vec3 target_pos;  // target position in 3D space (x, y, z)
 
-unsigned char* raw_image;  // 1D image
-unsigned char** image;     // 2D image
+unsigned char* raw_image;        // 1D image
+unsigned char** image;           // 2D image
+unsigned char* raw_local_image;  // 1D image
+unsigned char** local_image;     // 2D image
 
 int world_rank;  // Mpi world_rank
 int world_size;  // Mpi world_size
-double* raw_local_color;
-double** local_color;
-double* raw_global_color;
-double** global_color;
+// unsigned int* taskList;
 unsigned int total_tasks;
 clock_t start_time, end_time;
 
 pthread_mutex_t mutex;
 pthread_t* threads;
-int processor_tbi;
-int processor_iter_idx;
-
-unsigned int task_block_size;
-unsigned int total_task_blocks;
-unsigned int done_rank_counter;
-unsigned int task_block_counter;
-unsigned int* raw_tasks;
-unsigned int** tasks;
+int num_pthreads;
+int num_block_size;
+int global_iter_idx;
+int local_iter_idx, local_iter_offset;
 
 // save raw_image to PNG file
 void write_png(const char* filename) {
@@ -174,31 +168,166 @@ double trace(vec3 ro, vec3 rd, double& trap, int& ID) {
                : -1.;  // if exceeds the far plane then return -1 which means the ray missed a shot
 }
 
-void slave() {
-    //---start rendering
-    while (1) {
-        int tbi, tmp;
-        MPI_Ssend(&tmp, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
-        MPI_Recv(&tbi, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        // printf("Received task block: %d\n", tbi);
-        if (tbi >= total_task_blocks)
-            return;
-#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
-        for (int iter_idx = 0; iter_idx < task_block_size; ++iter_idx) {
-            if (tbi * task_block_size + iter_idx < (int)total_tasks) {
-                int iter = tasks[tbi][iter_idx];
-                // for (int iter_idx = world_rank; iter_idx < total_tasks; iter_idx += world_size) {
-                // int iter = raw_tasks[iter_idx];
-                // for (int iter = world_rank; iter < total_tasks; iter += world_size) {
-                // int i = (iter / (AA * AA)) / width;
-                // int j = (iter / (AA * AA)) % width;
-                // int n = (iter % (AA * AA)) / AA;
-                // int m = iter % AA;
-                int i = (iter >> 2) / width;
-                int j = (iter >> 2) % width;
-                int n = (iter & (1 << 1)) ? 1 : 0;
-                int m = (iter & 1) ? 1 : 0;
+void* processor(void* arg);
+void* controller(void* arg);
+void slave();
+void master();
 
+int main(int argc, char** argv) {
+    // ./source [num_threads] [x1] [y1] [z1] [x2] [y2] [z2] [width] [height] [filename]
+    // num_threads: number of threads per process
+    // x1 y1 z1: camera position in 3D space
+    // x2 y2 z2: target position in 3D space
+    // width height: image size
+    // filename: filename
+    assert(argc == 11);
+
+    //---init arguments
+    num_threads = atoi(argv[1]);
+    num_pthreads = num_threads - 1;
+    camera_pos = vec3(atof(argv[2]), atof(argv[3]), atof(argv[4]));
+    target_pos = vec3(atof(argv[5]), atof(argv[6]), atof(argv[7]));
+    width = atoi(argv[8]);
+    height = atoi(argv[9]);
+    total_tasks = width * height;
+    iResolution = vec2(width, height);
+    num_block_size = num_threads * 10;
+
+    // taskList = new unsigned int[total_tasks];
+    // for (int pix = 0; pix < total_tasks; ++pix) taskList[pix] = pix;
+    // std::random_shuffle(taskList, taskList + total_tasks);
+    //---
+
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+    mutex = PTHREAD_MUTEX_INITIALIZER;
+    threads = new pthread_t[num_pthreads];
+    pthread_mutex_init(&mutex, NULL);
+
+    //---create image
+    raw_image = new unsigned char[width * height * SQAA];
+    image = new unsigned char*[height];
+#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
+    for (int i = 0; i < height; ++i) {
+        image[i] = raw_image + i * width * SQAA;
+    }
+    //---
+
+    //---create image
+    raw_local_image = new unsigned char[width * height * SQAA];
+    local_image = new unsigned char*[height];
+#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
+    for (int i = 0; i < height; ++i) {
+        local_image[i] = raw_local_image + i * width * SQAA;
+    }
+    //---
+
+    if (world_rank == 0) {
+        master();
+    } else {
+        slave();
+    }
+
+    MPI_Reduce(raw_local_image, raw_image, height * width * SQAA, MPI_UNSIGNED_CHAR, MPI_SUM, 0, MPI_COMM_WORLD);
+    //---saving image
+    if (world_rank == 0) {
+        write_png(argv[10]);
+    }
+    //---
+
+    //---finalize
+    delete[] raw_image;
+    delete[] image;
+    delete[] raw_local_image;
+    delete[] local_image;
+    // delete[] taskList;
+    delete[] threads;
+    pthread_mutex_destroy(&mutex);
+    MPI_Finalize();
+    //---
+    return 0;
+}
+
+void master() {
+    global_iter_idx = 0;
+    pthread_create(&threads[0], NULL, controller, NULL);
+    while (1) {
+        pthread_mutex_lock(&mutex);
+        local_iter_idx = global_iter_idx;
+        global_iter_idx += num_block_size;
+        pthread_mutex_unlock(&mutex);
+        if (local_iter_idx >= total_tasks)
+            break;
+        local_iter_offset = 0;
+        for (int pid = 1; pid < num_pthreads; ++pid) {
+            pthread_create(&threads[pid], NULL, processor, NULL);
+        }
+        processor(NULL);
+        for (int pid = 1; pid < num_pthreads; ++pid) {
+            pthread_join(threads[pid], 0);
+        }
+    }
+    pthread_join(threads[0], 0);
+    return;
+}
+
+void slave() {
+    int tmp;
+    while (1) {
+        tmp = 0;
+        MPI_Send(&tmp, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
+        MPI_Recv(&local_iter_idx, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        if (local_iter_idx >= total_tasks)
+            break;
+        local_iter_offset = 0;
+        for (int pid = 0; pid < num_pthreads; ++pid) {
+            pthread_create(&threads[pid], NULL, processor, NULL);
+        }
+        processor(NULL);
+        for (int pid = 0; pid < num_pthreads; ++pid) {
+            pthread_join(threads[pid], 0);
+        }
+    }
+    tmp = 1;
+    MPI_Send(&tmp, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
+    return;
+}
+
+void* controller(void* arg) {
+    int global_done_ranks = 0;
+    while (global_done_ranks < world_size - 1) {
+        MPI_Status status;
+        int tmp;
+        MPI_Recv(&tmp, 1, MPI_INT, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
+        if (tmp == 0) {
+            pthread_mutex_lock(&mutex);
+            MPI_Send(&global_iter_idx, 1, MPI_INT, status.MPI_SOURCE, 0, MPI_COMM_WORLD);
+            global_iter_idx += num_block_size;
+            pthread_mutex_unlock(&mutex);
+        } else if (tmp == 1) {
+            global_done_ranks++;
+        }
+    }
+    return NULL;
+}
+
+void* processor(void* arg) {
+    while (1) {
+        int iter_idx;
+        pthread_mutex_lock(&mutex);
+        iter_idx = local_iter_idx + local_iter_offset++;
+        pthread_mutex_unlock(&mutex);
+
+        if (iter_idx >= local_iter_idx + num_block_size || iter_idx >= total_tasks)
+            break;
+        int iter = /* taskList[iter_idx] */ iter_idx;
+        int i = iter / width;
+        int j = iter % width;
+        vec4 fcol(0.);
+        for (int n = 0; n < AA; n++) {
+            for (int m = 0; m < AA; m++) {
                 vec2 p = vec2(j, i) + vec2(m, n) / (double)AA;
 
                 vec2 uv = (-iResolution.xy() + 2. * p) / iResolution.y;
@@ -259,281 +388,22 @@ void slave() {
                     col = glm::pow(col, vec3(.7, .9, 1.));  // fake SSS (subsurface scattering)
                     col += spe * 0.8;                       // specular
                 }
-                //---
-
                 col = glm::clamp(glm::pow(col, vec3(.4545)), 0., 1.);  // gamma correction
-
-#pragma omp critical
-                {
-                    local_color[i][(SQAA - 1) * j + 0] += col.r;
-                    local_color[i][(SQAA - 1) * j + 1] += col.g;
-                    local_color[i][(SQAA - 1) * j + 2] += col.b;
-                }
+                //---
+                fcol += vec4(col, 1.);
             }
         }
-    }
-    //---
-}
+        fcol /= (double)(SQAA);
+        fcol *= 255.0;
 
-void* processor(void* arg) {
-    int tbi;
-    int iter_idx;
-    while (1) {
         pthread_mutex_lock(&mutex);
-        tbi = processor_tbi;
-        iter_idx = processor_iter_idx++;
-        pthread_mutex_unlock(&mutex);
-        if (iter_idx >= task_block_size)
-            break;
-        if (tbi * task_block_size + iter_idx < (int)total_tasks) {
-            int iter = tasks[tbi][iter_idx];
-            // for (int iter_idx = world_rank; iter_idx < total_tasks; iter_idx += world_size) {
-            // int iter = raw_tasks[iter_idx];
-            // for (int iter = world_rank; iter < total_tasks; iter += world_size) {
-            // int i = (iter / (AA * AA)) / width;
-            // int j = (iter / (AA * AA)) % width;
-            // int n = (iter % (AA * AA)) / AA;
-            // int m = iter % AA;
-            int i = (iter >> 2) / width;
-            int j = (iter >> 2) % width;
-            int n = (iter & (1 << 1)) ? 1 : 0;
-            int m = (iter & 1) ? 1 : 0;
-
-            vec2 p = vec2(j, i) + vec2(m, n) / (double)AA;
-
-            vec2 uv = (-iResolution.xy() + 2. * p) / iResolution.y;
-            uv.y *= -1;  // flip upside down
-            //---
-
-            //---create camera
-            vec3 cf = glm::normalize(target_pos - camera_pos);  // forward vector
-            vec3 cs =
-                glm::normalize(glm::cross(cf, vec3(0., 1., 0.)));        // right (side) vector
-            vec3 cu = glm::normalize(glm::cross(cs, cf));                // up vector
-            vec3 rd = glm::normalize(uv.x * cs + uv.y * cu + FOV * cf);  // ray direction
-            //---
-
-            //---marching
-            double trap;  // orbit trap
-            int objID;    // the object id intersected with
-            double d = trace(camera_pos, rd, trap, objID);
-            //---
-
-            //---lighting
-            vec3 col(0.);                          // color
-            vec3 sd = glm::normalize(camera_pos);  // sun direction (directional light)
-            vec3 sc = vec3(1., .9, .717);          // light color
-            //---
-
-            //---coloring
-            if (d < 0.) {        // miss (hit sky)
-                col = vec3(0.);  // sky color (black)
-            } else {
-                vec3 pos = camera_pos + rd * d;      // hit position
-                vec3 nr = calcNor(pos);              // get surface normal
-                vec3 hal = glm::normalize(sd - rd);  // blinn-phong lighting model (vector
-                                                     // h)
-                // for more info:
-                // https://en.wikipedia.org/wiki/Blinn%E2%80%93Phong_shading_model
-
-                // use orbit trap to get the color
-                col = pal(trap - .4, vec3(.5), vec3(.5), vec3(1.),
-                          vec3(.0, .1, .2));  // diffuse color
-                vec3 ambc = vec3(0.3);        // ambient color
-                double gloss = 32.;           // specular gloss
-
-                // simple blinn phong lighting model
-                double amb =
-                    (0.7 + 0.3 * nr.y) *
-                    (0.2 + 0.8 * glm::clamp(0.05 * log(trap), 0.0, 1.0));  // self occlution
-                double sdw = softshadow(pos + .001 * nr, sd, 16.);         // shadow
-                double dif = glm::clamp(glm::dot(sd, nr), 0., 1.) * sdw;   // diffuse
-                double spe = glm::pow(glm::clamp(glm::dot(nr, hal), 0., 1.), gloss) *
-                             dif;  // self shadow
-
-                vec3 lin(0.);
-                lin += ambc * (.05 + .95 * amb);  // ambient color * ambient
-                lin += sc * dif * 0.8;            // diffuse * light color * light intensity
-                col *= lin;
-
-                col = glm::pow(col, vec3(.7, .9, 1.));  // fake SSS (subsurface scattering)
-                col += spe * 0.8;                       // specular
-            }
-            //---
-
-            col = glm::clamp(glm::pow(col, vec3(.4545)), 0., 1.);  // gamma correction
-
-            pthread_mutex_lock(&mutex);
-            local_color[i][(SQAA - 1) * j + 0] += col.r;
-            local_color[i][(SQAA - 1) * j + 1] += col.g;
-            local_color[i][(SQAA - 1) * j + 2] += col.b;
-            pthread_mutex_unlock(&mutex);
-        }
-    }
-    return NULL;
-}
-
-// MPI controller at rank=0, thread=0
-void* controller(void* arg) {
-    while (done_rank_counter < world_size - 1) {
-        // printf("current task blocks %d\n", tbi);
-        MPI_Status status;
-        int tmp;
-        MPI_Recv(&tmp, 1, MPI_INT, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
-        MPI_Ssend(&task_block_counter, 1, MPI_INT, status.MPI_SOURCE, 0, MPI_COMM_WORLD);
-        pthread_mutex_lock(&mutex);
-        if (task_block_counter >= total_task_blocks)
-            done_rank_counter++;
-        else
-            task_block_counter++;
+        local_image[i][SQAA * j + 0] = fcol.r;
+        local_image[i][SQAA * j + 1] = fcol.g;
+        local_image[i][SQAA * j + 2] = fcol.b;
+        local_image[i][SQAA * j + 3] = 255;
         pthread_mutex_unlock(&mutex);
     }
     return NULL;
-}
-
-void master() {
-    mutex = PTHREAD_MUTEX_INITIALIZER;
-    threads = new pthread_t[num_threads];
-    done_rank_counter = 0;
-    task_block_counter = 0;
-    pthread_mutex_init(&mutex, NULL);
-    pthread_create(&threads[0], NULL, controller, 0);
-    //---master start rendering
-    while (1) {
-        pthread_mutex_lock(&mutex);
-        processor_iter_idx = 0;
-        processor_tbi = task_block_counter++;
-        pthread_mutex_unlock(&mutex);
-        if (processor_tbi >= total_task_blocks)
-            break;
-
-        for (int pid = 1; pid < num_threads - 1; ++pid) {
-            pthread_create(&threads[pid], NULL, processor, NULL);
-        }
-        processor(NULL);
-        for (int pid = 1; pid < num_threads - 1; ++pid) {
-            pthread_join(threads[pid], 0);
-        }
-    }
-    //---
-    pthread_join(threads[0], 0);
-    pthread_mutex_destroy(&mutex);
-}
-
-int main(int argc, char** argv) {
-    // ./source [num_threads] [x1] [y1] [z1] [x2] [y2] [z2] [width] [height] [filename]
-    // num_threads: number of threads per process
-    // x1 y1 z1: camera position in 3D space
-    // x2 y2 z2: target position in 3D space
-    // width height: image size
-    // filename: filename
-    assert(argc == 11);
-
-    //---init arguments
-    num_threads = atoi(argv[1]);
-    camera_pos = vec3(atof(argv[2]), atof(argv[3]), atof(argv[4]));
-    target_pos = vec3(atof(argv[5]), atof(argv[6]), atof(argv[7]));
-    width = atoi(argv[8]);
-    height = atoi(argv[9]);
-    total_tasks = width * height * SQAA;
-    iResolution = vec2(width, height);
-    //---
-
-    //---raw_tasks distribute
-    total_task_blocks = 20 * num_threads;
-    task_block_size = ceil((double)total_tasks / total_task_blocks);
-    // total_task_blocks = ceil((double)total_tasks / task_block_size);
-    raw_tasks = new unsigned int[total_tasks];
-    tasks = new unsigned int*[total_task_blocks];
-    for (int pix = 0; pix < total_tasks; ++pix) raw_tasks[pix] = pix;
-    std::random_shuffle(raw_tasks, raw_tasks + total_tasks);
-    for (int i = 0; i < total_task_blocks; i++) {
-        tasks[i] = raw_tasks + i * task_block_size;
-    }
-    //---
-
-    start_time = clock();
-    //===MPI start=====================================================================================
-    MPI_Init(&argc, &argv);
-    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-
-    //---create image
-    raw_image = new unsigned char[width * height * SQAA];
-    image = new unsigned char*[height];
-#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
-    for (int i = 0; i < height; ++i) {
-        image[i] = raw_image + i * width * SQAA;
-    }
-    //---
-
-    //---create local color
-    raw_local_color = new double[width * height * (SQAA - 1)];
-    memset(raw_local_color, 0, width * height * (SQAA - 1) * sizeof(double));
-    local_color = new double*[height];
-#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
-    for (int i = 0; i < height; ++i) {
-        local_color[i] = raw_local_color + i * width * (SQAA - 1);
-    }
-    //---
-
-    //---create global color
-    raw_global_color = new double[width * height * (SQAA - 1)];
-    global_color = new double*[height];
-#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
-    for (int i = 0; i < height; ++i) {
-        global_color[i] = raw_global_color + i * width * (SQAA - 1);
-    }
-    //---
-
-    if (world_rank == 0) {
-        master();
-    } else {
-        slave();
-    }
-
-    end_time = clock();
-    printf("Rank %d : %lf\n", world_rank, (double)(end_time - start_time) * 1000. / CLOCKS_PER_SEC);
-    MPI_Reduce(raw_local_color, raw_global_color, height * width * (SQAA - 1), MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Finalize();
-    //===MPI raw_tasks=====================================================================================
-
-    if (world_rank == 0) {
-#pragma omp parallel for schedule(dynamic) num_threads(num_threads) collapse(3)
-        for (int i = 0; i < height; ++i) {
-            for (int j = 0; j < width; ++j) {
-                for (int c = 0; c < (SQAA - 1); ++c) {
-                    global_color[i][(SQAA - 1) * j + c] /= (double)(SQAA);
-                    global_color[i][(SQAA - 1) * j + c] *= 255.0;
-                    image[i][SQAA * j + c] = (unsigned char)global_color[i][(SQAA - 1) * j + c];  // rgb
-                }
-            }
-        }
-#pragma omp parallel for schedule(dynamic) num_threads(num_threads) collapse(2)
-        for (int i = 0; i < height; ++i) {
-            for (int j = 0; j < width; ++j) {
-                image[i][SQAA * j + 3] = 255;  // a
-            }
-        }
-    }
-
-    //---saving image
-    if (world_rank == 0) {
-        write_png(argv[10]);
-    }
-    //---
-
-    //---finalize
-    delete[] raw_image;
-    delete[] image;
-    delete[] raw_local_color;
-    delete[] local_color;
-    delete[] raw_global_color;
-    delete[] global_color;
-    delete[] raw_tasks;
-    //---
-
-    return 0;
 }
 /*
 make;time srun -N2 -n3 -c4 -t0:100 ./hw2 4 2 0.1 0.1 0 0 0 128 128 output/test.png;
